@@ -1,63 +1,47 @@
 import puter from "@heyputer/puter.js";
-import {
-    createHostingSlug,
-    fetchBlobFromUrl, getHostedUrl,
-    getImageExtension,
-    HOSTING_CONFIG_KEY,
-    imageUrlToPngBlob,
-    isHostedUrl
-} from "./utils";
+import {ROOMIFY_RENDER_PROMPT} from "./constants";
 
-export const getOrCreateHostingConfig = async (): Promise<HostingConfig | null> => {
-    const existing = (await puter.kv.get(HOSTING_CONFIG_KEY)) as HostingConfig | null;
+export const fetchAsDataUrl = async (url: string): Promise<string> => {
+    const response = await fetch(url);
 
-    if(existing?.subdomain) return { subdomain: existing.subdomain };
-
-    const subdomain = createHostingSlug();
-
-    try {
-        const created = await puter.hosting.create(subdomain, '.');
-
-        const record = { subdomain: created.subdomain };
-
-        await puter.kv.set(HOSTING_CONFIG_KEY, record);
-
-        return record;
-    } catch (e) {
-        console.warn(`Could not find subdomain: ${e}`);
-        return null;
+    if (!response.ok) {
+        throw new Error(`Failed to fetch image: ${response.statusText}`);
     }
-}
 
-export const uploadImageToHosting = async ({ hosting, url, projectId, label }: StoreHostedImageParams): Promise<HostedAsset | null> => {
-    if(!hosting || !url) return null;
-    if(isHostedUrl(url)) return { url };
+    const blob = await response.blob();
 
-    try {
-        const resolved = label === "rendered"
-            ? await imageUrlToPngBlob(url)
-                .then((blob) => blob ? { blob, contentType: 'image/png' }: null)
-            : await fetchBlobFromUrl(url);
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+    });
+};
 
-        if(!resolved) return null;
+export const generate3DView = async ({ sourceImage }: Generate3DViewParams) => {
+    const dataUrl = sourceImage.startsWith('data:')
+        ? sourceImage
+        : await fetchAsDataUrl(sourceImage);
 
-        const contentType = resolved.contentType || resolved.blob.type || '';
-        const ext = getImageExtension(contentType, url);
-        const dir = `projects/${projectId}`;
-        const filePath = `${dir}/${label}.${ext}`;
+    const base64Data = dataUrl.split(',')[1];
+    const mimeType = dataUrl.split(';')[0].split(':')[1];
 
-        const uploadFile = new File([resolved.blob], `${label}.${ext}`, {
-            type: contentType,
-        });
+    if(!mimeType || !base64Data) throw new Error('Invalid source image payload');
 
-        await puter.fs.mkdir(dir, { createMissingParents: true });
-        await puter.fs.write(filePath, uploadFile);
+    const response = await puter.ai.txt2img(ROOMIFY_RENDER_PROMPT, {
+        provider: "gemini",
+        model: "gemini-2.5-flash-image-preview",
+        input_image: base64Data,
+        input_image_mime_type: mimeType,
+        ratio: { w: 1024, h: 1024 },
+    });
 
-        const hostedUrl = getHostedUrl({ subdomain: hosting.subdomain }, filePath);
+    const rawImageUrl = (response as HTMLImageElement).src ?? null;
 
-        return hostedUrl ? { url: hostedUrl } : null;
-    } catch (e) {
-        console.warn(`Failed to store hosted image: ${e}`);
-        return null;
-    }
+    if (!rawImageUrl) return { renderedImage: null, renderedPath: undefined };
+
+    const renderedImage = rawImageUrl.startsWith('data:')
+        ? rawImageUrl : await fetchAsDataUrl(rawImageUrl);
+
+    return { renderedImage, renderedPath: undefined };
 }
